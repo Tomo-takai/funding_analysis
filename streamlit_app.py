@@ -13,6 +13,7 @@ from typing import List, Dict, Any, Tuple
 import re
 import json
 import os
+from datetime import datetime, timedelta
 
 # Set page configuration
 st.set_page_config(
@@ -122,7 +123,7 @@ def fetch_from_groq(start_date, end_date, api_key):
         - investors: Comma-separated list of real investors active in Germany
         - valuation_millions: Post-money valuation in millions of euros (or 0 if unknown)
         
-        Generate data for 15-20 different startups. Make sure to:
+        Generate data for approximately 200 different funding events. It's okay to have multiple funding rounds for the same startup as long as they're realistically spaced in time. Make sure to:
         1. Use real German startup names like N26, Celonis, GetYourGuide, etc.
         2. Match startups with their likely industries (e.g., N26 is Fintech)
         3. Match startups with their actual locations (e.g., N26 is in Berlin)
@@ -138,7 +139,7 @@ def fetch_from_groq(start_date, end_date, api_key):
                 {"role": "user", "content": user_prompt}
             ],
             "temperature": 0.3,  # Lower temperature for more factual responses
-            "max_tokens": 4000
+            "max_tokens": 8000
         }
         
         # Make API request
@@ -203,6 +204,52 @@ def fetch_from_groq(start_date, end_date, api_key):
             
             processed_data.append(processed_entry)
         
+        # If we got fewer than expected entries, make a second request to get more
+        if len(processed_data) < 100:
+            st.info(f"Only received {len(processed_data)} entries, requesting more...")
+            
+            # Make a second request with a different prompt
+            payload["messages"][1]["content"] = user_prompt + "\nPlease generate different startups than in your previous response."
+            response = requests.post(base_url, json=payload, headers=headers)
+            
+            if response.status_code == 200:
+                data = response.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                json_start = content.find("[")
+                json_end = content.rfind("]") + 1
+                
+                if json_start != -1 and json_end != 0:
+                    json_str = content[json_start:json_end]
+                    try:
+                        more_funding_data = json.loads(json_str)
+                        
+                        for entry in more_funding_data:
+                            try:
+                                funding_date = datetime.strptime(entry.get("funding_date", ""), "%Y-%m-%d")
+                            except ValueError:
+                                days_range = (end_date - start_date).days
+                                random_days = random.randint(0, max(1, days_range))
+                                funding_date = start_date + timedelta(days=random_days)
+                            
+                            processed_entry = {
+                                'startup_name': entry.get('startup_name', ''),
+                                'industry': entry.get('industry', ''),
+                                'country': 'Germany',
+                                'city': entry.get('city', ''),
+                                'funding_round': entry.get('funding_round', ''),
+                                'funding_amount_millions': float(entry.get('funding_amount_millions', 0)),
+                                'funding_date': funding_date,
+                                'investors': entry.get('investors', ''),
+                                'valuation_millions': float(entry.get('valuation_millions', 0)),
+                                'year': funding_date.year,
+                                'month': funding_date.month,
+                                'quarter': (funding_date.month - 1) // 3 + 1
+                            }
+                            
+                            processed_data.append(processed_entry)
+                    except json.JSONDecodeError:
+                        st.warning("Could not parse additional data")
+        
         # Convert to DataFrame
         df = pd.DataFrame(processed_data)
         st.success(f"Successfully generated {len(df)} funding rounds from Groq API.")
@@ -213,72 +260,458 @@ def fetch_from_groq(start_date, end_date, api_key):
         st.exception(e)
         return None
 
-# Web scraping function for German startup funding news
+# Enhanced web scraping function for real German startup funding data
 def scrape_startup_funding_news():
-    """Scrapes recent German startup funding news from tech news sites"""
+    """
+    Scrapes real German startup funding news from multiple tech news sites
+    using BeautifulSoup for proper HTML parsing
+    """
     try:
-        st.info("Scraping recent German startup funding news...")
+        st.info("Scraping real German startup funding data from multiple sources...")
         
-        # EU-Startups.com - a good source for German startup news
-        url = "https://www.eu-startups.com/category/germany-startups/"
+        # Import BeautifulSoup for proper HTML parsing
+        from bs4 import BeautifulSoup
+        import re
+        import time
+        
+        # List of sources to check with their specific parsing strategies
+        sources = [
+            {
+                "url": "https://www.eu-startups.com/category/germany-startups/",
+                "name": "EU-Startups",
+                "pages": 5  # Scrape up to 5 pages
+            },
+            {
+                "url": "https://sifted.eu/articles/tag/germany",
+                "name": "Sifted",
+                "pages": 3
+            },
+            {
+                "url": "https://techcrunch.com/tag/germany/",
+                "name": "TechCrunch",
+                "pages": 3
+            },
+            {
+                "url": "https://tech.eu/category/germany/",
+                "name": "Tech.eu",
+                "pages": 3
+            }
+        ]
         
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
         
-        response = requests.get(url, headers=headers)
+        all_articles = []
         
-        if response.status_code != 200:
-            st.warning(f"Failed to fetch data: {response.status_code}")
-            return None
-        
-        # Using regex to extract startup funding data
-        # In a real implementation, we would use proper HTML parsing with BeautifulSoup
-        funding_matches = re.findall(r'([A-Za-z0-9\s]+) raises ([€$][0-9\.]+[KMB]) (?:in|for|to)', response.text)
-        
-        if not funding_matches:
-            st.warning("No funding news found from scraping.")
-            return []
-        
-        # Process matches into data
-        scraped_data = []
-        today = datetime.now().date()
-        
-        for match in funding_matches:
-            startup_name = match[0].strip()
-            funding_str = match[1]
+        # Step 1: Get all articles from all sources
+        for source in sources:
+            st.text(f"Collecting articles from {source['name']}...")
+            base_url = source['url']
             
-            # Parse funding amount
-            amount = float(re.sub(r'[^0-9\.]', '', funding_str))
-            
-            # Convert to millions
-            if 'K' in funding_str:
-                amount /= 1000  # Convert K to M
-            elif 'B' in funding_str:
-                amount *= 1000  # Convert B to M
+            for page in range(1, source['pages'] + 1):
+                try:
+                    # Handle pagination differently based on the source
+                    if page > 1:
+                        if "eu-startups" in base_url:
+                            url = f"{base_url}page/{page}/"
+                        elif "sifted" in base_url:
+                            url = f"{base_url}/page/{page}"
+                        elif "techcrunch" in base_url:
+                            url = f"{base_url}/page/{page}/"
+                        elif "tech.eu" in base_url:
+                            url = f"{base_url}/page/{page}"
+                        else:
+                            url = base_url
+                    else:
+                        url = base_url
+                    
+                    st.text(f"  Scraping page {page}: {url}")
+                    response = requests.get(url, headers=headers, timeout=15)
+                    
+                    if response.status_code != 200:
+                        st.warning(f"Failed to fetch page {page} from {source['name']}: {response.status_code}")
+                        continue
+                    
+                    soup = BeautifulSoup(response.content, 'html.parser')
+                    
+                    # Different parsing for different sources
+                    if "eu-startups" in url:
+                        articles = soup.find_all('article')
+                        for article in articles:
+                            title_elem = article.find('h2', class_='entry-title')
+                            if not title_elem:
+                                continue
+                                
+                            title = title_elem.text.strip()
+                            link = title_elem.find('a')['href'] if title_elem.find('a') else None
+                            date_elem = article.find('time', class_='entry-date')
+                            date_str = date_elem['datetime'].split('T')[0] if date_elem else None
+                            
+                            if title and link and date_str:
+                                all_articles.append({
+                                    'title': title,
+                                    'url': link,
+                                    'date': date_str,
+                                    'source': source['name']
+                                })
+                    
+                    elif "sifted" in url:
+                        articles = soup.find_all('div', class_='articleCard')
+                        for article in articles:
+                            title_elem = article.find('h3')
+                            if not title_elem:
+                                continue
+                                
+                            title = title_elem.text.strip()
+                            link_elem = article.find('a')
+                            link = f"https://sifted.eu{link_elem['href']}" if link_elem else None
+                            date_elem = article.find('span', class_='date')
+                            date_str = parse_date_text(date_elem.text.strip()) if date_elem else None
+                            
+                            if title and link:
+                                all_articles.append({
+                                    'title': title,
+                                    'url': link,
+                                    'date': date_str,
+                                    'source': source['name']
+                                })
+                    
+                    elif "techcrunch" in url:
+                        articles = soup.find_all('div', class_='post-block')
+                        for article in articles:
+                            title_elem = article.find('h2')
+                            if not title_elem:
+                                continue
+                                
+                            title = title_elem.text.strip()
+                            link_elem = article.find('a', class_='post-block__title__link')
+                            link = link_elem['href'] if link_elem else None
+                            date_elem = article.find('time')
+                            date_str = date_elem['datetime'].split('T')[0] if date_elem else None
+                            
+                            if title and link and date_str:
+                                all_articles.append({
+                                    'title': title,
+                                    'url': link,
+                                    'date': date_str,
+                                    'source': source['name']
+                                })
+                    
+                    elif "tech.eu" in url:
+                        articles = soup.find_all('article')
+                        for article in articles:
+                            title_elem = article.find('h3', class_='entry-title')
+                            if not title_elem:
+                                continue
+                                
+                            title = title_elem.text.strip()
+                            link = title_elem.find('a')['href'] if title_elem.find('a') else None
+                            date_elem = article.find('time', class_='entry-date')
+                            date_str = date_elem['datetime'].split('T')[0] if date_elem else None
+                            
+                            if title and link and date_str:
+                                all_articles.append({
+                                    'title': title,
+                                    'url': link,
+                                    'date': date_str,
+                                    'source': source['name']
+                                })
+                    
+                    # Respect websites by adding a small delay between requests
+                    time.sleep(1)
+                    
+                except Exception as e:
+                    st.warning(f"Error scraping page {page} from {source['name']}: {str(e)}")
+                    continue
+        
+        st.text(f"Collected {len(all_articles)} articles from all sources")
+        
+        # Step 2: Filter for funding-related articles
+        funding_keywords = [
+            'raises', 'raised', 'secures', 'secured', 'funding', 'investment',
+            'series', 'round', 'million', 'financing', 'seed', 'venture',
+            'capital', 'VC ', 'investors', 'euros', '€', 'IPO'
+        ]
+        
+        funding_articles = []
+        for article in all_articles:
+            title = article['title'].lower()
+            if any(keyword.lower() in title for keyword in funding_keywords):
+                funding_articles.append(article)
+        
+        st.text(f"Found {len(funding_articles)} articles about funding")
+        
+        # Step 3: Extract detailed information from each article
+        funding_data = []
+        for idx, article in enumerate(funding_articles[:200]):  # Limiting to 200 to avoid excessive scraping
+            try:
+                title = article['title']
+                url = article['url']
+                date_str = article['date']
                 
-            # Dummy/estimated data for missing fields
-            scraped_data.append({
-                'startup_name': startup_name,
-                'industry': 'Tech',  # Default industry
-                'country': 'Germany',
-                'city': 'Berlin',  # Default city
-                'funding_round': 'Unknown',
-                'funding_amount_millions': round(amount, 2),
-                'funding_date': today - timedelta(days=random.randint(0, 30)),  # Rough estimate
-                'investors': 'Unknown',
-                'valuation_millions': 0,  # Unknown
-            })
+                # Skip if we don't have a date
+                if not date_str:
+                    continue
+                
+                # Try to convert string to date
+                try:
+                    funding_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                except:
+                    # If we couldn't parse the date, skip this article
+                    continue
+                
+                # Extract startup name, funding amount from title
+                startup_name = extract_startup_name(title)
+                funding_amount = extract_funding_amount(title)
+                funding_round = extract_funding_round(title)
+                
+                # Only continue if we have the key information
+                if not (startup_name and funding_amount > 0):
+                    continue
+                
+                # Try to get more details from the article itself
+                try:
+                    article_response = requests.get(url, headers=headers, timeout=10)
+                    if article_response.status_code == 200:
+                        article_soup = BeautifulSoup(article_response.content, 'html.parser')
+                        article_text = article_soup.get_text()
+                        
+                        # Try to extract city from article text
+                        city = extract_city(article_text)
+                        industry = extract_industry(article_text)
+                        investors = extract_investors(article_text)
+                        
+                        # If we couldn't extract these, use some defaults
+                        if not city:
+                            city = "Berlin"  # Default to most common German startup hub
+                        if not industry:
+                            industry = "Tech"  # Default industry
+                        if not investors:
+                            investors = "Undisclosed"
+                        
+                        # Skip non-German articles
+                        if not is_german_startup(article_text, title, startup_name):
+                            continue
+                            
+                    else:
+                        # If we can't get the article, use some defaults
+                        city = "Berlin"
+                        industry = "Tech"
+                        investors = "Undisclosed"
+                except:
+                    # If there's an error, use defaults
+                    city = "Berlin"
+                    industry = "Tech" 
+                    investors = "Undisclosed"
+                
+                # Calculate quarter from the date
+                year = funding_date.year
+                month = funding_date.month
+                quarter = (month - 1) // 3 + 1
+                
+                # Estimate valuation (if not found, typically 4-5x the funding amount)
+                valuation_millions = funding_amount * random.uniform(4, 5)
+                
+                # Add the entry to our funding data
+                funding_data.append({
+                    'startup_name': startup_name,
+                    'industry': industry,
+                    'country': 'Germany',
+                    'city': city,
+                    'funding_round': funding_round,
+                    'funding_amount_millions': funding_amount,
+                    'funding_date': funding_date,
+                    'investors': investors,
+                    'valuation_millions': round(valuation_millions, 2),
+                    'year': year,
+                    'month': month,
+                    'quarter': quarter,
+                    'source': article['source'],
+                    'source_url': url
+                })
+                
+                # Log progress every 10 articles
+                if (idx + 1) % 10 == 0:
+                    st.text(f"Processed {idx + 1}/{len(funding_articles)} funding articles")
+                
+                # Add a short delay to avoid overwhelming the servers
+                time.sleep(0.5)
+                
+            except Exception as e:
+                st.warning(f"Error processing article {article['title']}: {str(e)}")
+                continue
         
-        st.success(f"Found {len(scraped_data)} recent funding news items.")
-        return scraped_data
+        # Remove duplicates (same startup with same funding round within 30 days)
+        unique_funding_data = []
+        seen_startups = {}
+        
+        for entry in funding_data:
+            startup = entry['startup_name']
+            funding_round = entry['funding_round']
+            funding_date = entry['funding_date']
+            
+            key = f"{startup}|{funding_round}"
+            
+            if key in seen_startups:
+                # If we've seen this startup+round before, check if it's within 30 days
+                prev_date = seen_startups[key]
+                if abs((funding_date - prev_date).days) <= 30:
+                    # This is likely a duplicate, skip it
+                    continue
+            
+            seen_startups[key] = funding_date
+            unique_funding_data.append(entry)
+        
+        if not unique_funding_data:
+            st.warning("No funding data could be extracted. Falling back to demo data.")
+            return None
+            
+        st.success(f"Successfully extracted {len(unique_funding_data)} real German startup funding events")
+        return unique_funding_data
     
     except Exception as e:
-        st.error(f"Error scraping data: {str(e)}")
+        st.error(f"Error in web scraping process: {str(e)}")
+        st.exception(e)
         return None
 
+# Helper functions for extracting information from articles
+def parse_date_text(date_text):
+    """Convert text dates like '5 days ago' to YYYY-MM-DD format"""
+    today = datetime.now().date()
+    
+    if 'day' in date_text.lower():
+        # Extract number of days
+        days = re.search(r'(\d+)', date_text)
+        if days:
+            days = int(days.group(1))
+            date = today - timedelta(days=days)
+            return date.strftime('%Y-%m-%d')
+    
+    if 'week' in date_text.lower():
+        # Extract number of weeks
+        weeks = re.search(r'(\d+)', date_text)
+        if weeks:
+            weeks = int(weeks.group(1))
+            date = today - timedelta(days=weeks*7)
+            return date.strftime('%Y-%m-%d')
+    
+    if 'month' in date_text.lower():
+        # Extract number of months (approximation)
+        months = re.search(r'(\d+)', date_text)
+        if months:
+            months = int(months.group(1))
+            # Approximate a month as 30 days
+            date = today - timedelta(days=months*30)
+            return date.strftime('%Y-%m-%d')
+    
+    # Try to parse as a standard date
+    try:
+        date = datetime.strptime(date_text, '%B %d, %Y').date()
+        return date.strftime('%Y-%m-%d')
+    except:
+        pass
+    
+    try:
+        date = datetime.strptime(date_text, '%d %B %Y').date()
+        return date.strftime('%Y-%m-%d')
+    except:
+        pass
+    
+    # Return None if we couldn't parse the date
+    return None
+
+def extract_startup_name(title):
+    """Extract startup name from article title"""
+    # Common patterns like "Startup X raises €Y million"
+    patterns = [
+        r'([A-Z][A-Za-z0-9\-\.]+)(?:\s[A-Z][A-Za-z0-9\-\.]+)? raises',
+        r'([A-Z][A-Za-z0-9\-\.]+)(?:\s[A-Z][A-Za-z0-9\-\.]+)? secures',
+        r'([A-Z][A-Za-z0-9\-\.]+)(?:\s[A-Z][A-Za-z0-9\-\.]+)? gets',
+        r'([A-Z][A-Za-z0-9\-\.]+)(?:\s[A-Z][A-Za-z0-9\-\.]+)? closes',
+        r'([A-Z][A-Za-z0-9\-\.]+)(?:\s[A-Z][A-Za-z0-9\-\.]+)? lands',
+        r'([A-Z][A-Za-z0-9\-\.]+)(?:\s[A-Z][A-Za-z0-9\-\.]+)? announces',
+        r'([A-Z][A-Za-z0-9\-\.]+)(?:\s[A-Z][A-Za-z0-9\-\.]+)? bags',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, title)
+        if match:
+            return match.group(1).strip()
+    
+    # If no match is found, try to find the first proper noun 
+    words = title.split()
+    for word in words:
+        if word[0].isupper() and len(word) > 1 and word.lower() not in ['german', 'berlin', 'munich', 'germany', 'funding', 'raises', 'secures', 'series']:
+            return word.strip()
+    
+    return "Unknown Startup"
+
+def extract_funding_amount(title):
+    """Extract funding amount in millions of euros from article title"""
+    # Look for patterns like €10 million or $10M or 10 million euros
+    amount_patterns = [
+        r'€(\d+(?:\.\d+)?)\s*[Mm]illion',
+        r'€(\d+(?:\.\d+)?)\s*[Mm]',
+        r'\$(\d+(?:\.\d+)?)\s*[Mm]illion',
+        r'\$(\d+(?:\.\d+)?)\s*[Mm]',
+        r'(\d+(?:\.\d+)?)\s*[Mm]illion\s*€',
+        r'(\d+(?:\.\d+)?)\s*[Mm]illion\s*[Ee]uro',
+        r'(\d+(?:\.\d+)?)\s*[Mm]illion',  # Fixed line
+        r'(\d+(?:\.\d+)?)\s*[Bb]illion\s*€',
+        r'(\d+(?:\.\d+)?)\s*[Bb]',
+    ]
+    
+    for pattern in amount_patterns:
+        match = re.search(pattern, title)
+        if match:
+            amount = float(match.group(1))
+            
+            # Convert billions to millions
+            if 'billion' in pattern.lower():
+                amount *= 1000
+                
+            return round(amount, 2) if 'amount' in locals() else None  # Ensure this is inside a function
+    
+    # Look for patterns like €10M or $10M
+    amount_patterns_short = [
+        r'€(\d+(?:\.\d+)?)[Mm]',
+        r'\$(\d+(?:\.\d+)?)[Mm]',
+        r'(\d+(?:\.\d+)?)[Mm]€',
+        r'(\d+(?:\.\d+)?)[Mm]'
+    ]
+
+    for pattern in amount_patterns_short:
+        match = re.search(pattern, title)
+        if match:
+            return round(float(match.group(1)), 2)
+        r'€(\d+(?:\.\d+)?)[Mm]',
+        r'\$(\d+(?:\.\d+)?)[Mm]',
+        r'(\d+(?:\.\d+)?)[Mm]€',
+        r'(\d+(?:\.\d+)?)[Mm]',  # Fixed line
+    
+    
+    for pattern in amount_patterns_short:
+        match = re.search(pattern, title)
+        if match:
+            return round(float(match.group(1)), 2)
+    
+    # Look for patterns like €10 (implied millions)
+    amount_patterns_euro = [
+        r'€(\d+(?:\.\d+)?)\s[Mm]',
+        r'€(\d+(?:\.\d+)?)'
+    ]
+    
+    for pattern in amount_patterns_euro:
+        match = re.search(pattern, title)
+        if match:
+            amount = float(match.group(1))
+            return round(amount, 2) if amount < 100 else round(amount/1000, 2)
+    
+    return 0  # Default if no amount found
+
 # Function to fetch German startup funding data
-def fetch_german_startup_data(start_date, end_date, num_entries=100):
+def fetch_german_startup_data(start_date, end_date, num_entries=200):
     """
     Generates realistic demo data for German startups within the specified date range.
     
@@ -319,7 +752,20 @@ def fetch_german_startup_data(start_date, end_date, num_entries=100):
         "Choco", "Sennder", "Grover", "DeepL", "Pitch", "Razor Group", 
         "GoStudent", "Flink", "Vivid Money", "Fraugster", "Everphone",
         "Flix", "Volocopter", "The Climate Choice", "Dance", "Finleap", 
-        "BOOM", "DyeMansion", "Gorillas", "Babbel", "SumUp", "Wunderflats"
+        "BOOM", "DyeMansion", "Gorillas", "Babbel", "SumUp", "Wunderflats",
+        # Additional startups to reach higher count
+        "Scalable Capital", "Joblift", "Blinkist", "McMakler", "Flaschenpost",
+        "Tourlane", "Clark", "Billie", "Signavio", "Stocard", "IDnow",
+        "CrossEngage", "Simplesurance", "Smacc", "Cluno", "Homeday", "Catchys",
+        "Freighthub", "Medbelle", "Amboss", "Kaia Health", "EyeEm", "Zenjob",
+        "CareerFoundry", "Bliq", "Klarx", "Doctolib", "Isar Aerospace",
+        "Wandelbots", "CoachHub", "Xentral", "YFood", "Finanzguru", "MagForce",
+        "Moberries", "Shyftplan", "Hometogo", "Solaris", "Thermondo", "Elinvar",
+        "COMATCH", "Kreditech", "MEDWING", "Agricool", "Exporo", "Sono Motors",
+        "Urban Sports Club", "Horizn Studios", "Qunomedical", "Jobpal",
+        "FreightHub", "Campanda", "Sharpist", "Temedica", "Horizn Studios",
+        "TIER Mobility", "Getyourguide", "Staffbase", "Signavio", "Quentic",
+        "Talentspace", "Planetly", "Lendstar", "Zeitgold"
     ]
     
     # Real investor names
@@ -331,7 +777,16 @@ def fetch_german_startup_data(start_date, end_date, num_entries=100):
         "Capnamic Ventures", "Heartcore Capital", "La Famiglia", "Lakestar",
         "BlueYard Capital", "Picus Capital", "Global Founders Capital", 
         "Holtzbrinck Ventures", "EQT Ventures", "Balderton Capital", "Sequoia Capital",
-        "Accel", "Benchmark", "Index Ventures", "Lightspeed Venture Partners"
+        "Accel", "Benchmark", "Index Ventures", "Lightspeed Venture Partners",
+        # Additional investors for more variety
+        "Partech", "Atomico", "Headline", "DN Capital", "Insight Partners",
+        "Tiger Global", "SoftBank Vision Fund", "Bain Capital Ventures", 
+        "Eight Roads Ventures", "True Ventures", "Union Square Ventures",
+        "Kizoo Technology", "Seventure Partners", "Round Hill Capital",
+        "AP Ventures", "Impact Ventures", "Redstone", "Coparion",
+        "Bayern Kapital", "Wachstumsfonds Bayern", "KfW Capital",
+        "IBB Ventures", "NRW.Bank", "Mittelständische Beteiligungsgesellschaft", 
+        "Rheingau Founders", "Signals Venture Capital", "Gründerfonds Ruhr"
     ]
     
     # Map startups to most likely industries (for more realistic data)
@@ -380,7 +835,19 @@ def fetch_german_startup_data(start_date, end_date, num_entries=100):
         "Gorillas": "E-commerce",
         "Babbel": "Edtech",
         "SumUp": "Fintech",
-        "Wunderflats": "Proptech"
+        "Wunderflats": "Proptech",
+        "Scalable Capital": "Fintech",
+        "Blinkist": "Edtech",
+        "Billie": "Fintech",
+        "Tourlane": "E-commerce",
+        "Clark": "Insurtech",
+        "Simplesurance": "Insurtech",
+        "Kaia Health": "Healthtech",
+        "Doctolib": "Healthtech",
+        "YFood": "Foodtech",
+        "Sono Motors": "Mobility",
+        "CoachHub": "SaaS",
+        "Isar Aerospace": "Manufacturing"
     }
     
     # Map startups to most likely cities (for more realistic data)
@@ -429,7 +896,18 @@ def fetch_german_startup_data(start_date, end_date, num_entries=100):
         "Gorillas": "Berlin",
         "Babbel": "Berlin",
         "SumUp": "Berlin",
-        "Wunderflats": "Berlin"
+        "Wunderflats": "Berlin",
+        "Scalable Capital": "Munich",
+        "Blinkist": "Berlin",
+        "Clark": "Frankfurt",
+        "Billie": "Berlin",
+        "Tourlane": "Berlin",
+        "Kaia Health": "Munich",
+        "Doctolib": "Berlin",
+        "Isar Aerospace": "Munich",
+        "YFood": "Munich",
+        "Sono Motors": "Munich",
+        "CoachHub": "Berlin"
     }
     
     # Date range for data generation
@@ -440,67 +918,123 @@ def fetch_german_startup_data(start_date, end_date, num_entries=100):
     
     data = []
     
-    # Use each startup only once (more realistic)
-    shuffled_startups = random.sample(german_startup_names, min(len(german_startup_names), num_entries))
+    # Allow multiple rounds per startup to reach higher count
+    # Calculate how many rounds per startup we need
+    available_startups = len(german_startup_names)
+    rounds_per_startup = max(1, min(3, num_entries // available_startups + 1))
     
-    for startup_name in shuffled_startups:
-        # Generate random date within specified range
-        random_days = random.randint(0, days_range)
-        funding_date = start_date + timedelta(days=random_days)
-        
+    # Distribute startups evenly across the time period
+    for startup_name in german_startup_names:
+        # Generate up to rounds_per_startup funding rounds for each startup
+        # But stop if we've reached our target
+        if len(data) >= num_entries:
+            break
+            
         # Get most likely industry for this startup, or random if not mapped
         industry = startup_industries.get(startup_name, random.choice(industries))
         
         # Get most likely city for this startup, or random if not mapped
         city = startup_cities.get(startup_name, random.choice(german_cities))
         
-        # Generate appropriate funding amount based on startup profile
-        # Bigger names get bigger rounds
-        if startup_name in ["N26", "Celonis", "Lilium", "GetYourGuide", "HelloFresh", "Auto1"]:
-            round_type = random.choice(["Series C", "Series D+", "Growth"])
-            amount = random.uniform(50.0, 500.0)
-        elif startup_name in ["Personio", "Wefox", "Trade Republic", "Tier Mobility", "Gorillas"]:
-            round_type = random.choice(["Series B", "Series C"])
-            amount = random.uniform(20.0, 100.0)
-        else:
-            round_type = random.choice(funding_rounds)
-            if round_type == 'Seed':
-                amount = random.uniform(0.5, 3.0)  # €500K to €3M
-            elif round_type == 'Series A':
-                amount = random.uniform(3.0, 15.0)  # €3M to €15M
-            elif round_type == 'Series B':
-                amount = random.uniform(15.0, 50.0)  # €15M to €50M
-            elif round_type == 'Series C':
-                amount = random.uniform(50.0, 100.0)  # €50M to €100M
-            elif round_type == 'Series D+':
-                amount = random.uniform(100.0, 300.0)  # €100M to €300M
-            elif round_type == 'Growth':
-                amount = random.uniform(50.0, 500.0)  # €50M to €500M
-            else:  # IPO
-                amount = random.uniform(200.0, 1000.0)  # €200M to €1B
-        
-        # Real investors (1-4 investors per round)
-        num_investors = random.randint(1, 4)
-        investors = random.sample(german_investors, num_investors)
-        
-        # Valuation (typically a multiple of the funding amount)
-        valuation_multiple = random.uniform(3, 10)
-        valuation = amount * valuation_multiple
-        
-        data.append({
-            'startup_name': startup_name,
-            'industry': industry,
-            'country': 'Germany',
-            'city': city,
-            'funding_round': round_type,
-            'funding_amount_millions': round(amount, 2),
-            'funding_date': funding_date,
-            'investors': ', '.join(investors),
-            'valuation_millions': round(valuation, 2),
-            'year': funding_date.year,
-            'month': funding_date.month,
-            'quarter': (funding_date.month - 1) // 3 + 1
-        })
+        for i in range(rounds_per_startup):
+            # Stop if we've reached our target
+            if len(data) >= num_entries:
+                break
+                
+            # Space out rounds for the same startup
+            segment_size = days_range // rounds_per_startup
+            segment_start = i * segment_size
+            segment_end = (i + 1) * segment_size - 1
+            
+            random_days = random.randint(segment_start, segment_end)
+            funding_date = start_date + timedelta(days=random_days)
+            
+            # Choose appropriate funding round based on sequence
+            if i == 0:
+                possible_rounds = ['Seed', 'Series A']
+            elif i == 1:
+                possible_rounds = ['Series A', 'Series B']
+            else:
+                possible_rounds = ['Series B', 'Series C', 'Series D+', 'Growth']
+                
+            round_type = random.choice(possible_rounds)
+            
+            # Generate appropriate funding amount based on startup profile and round
+            if startup_name in ["N26", "Celonis", "Lilium", "GetYourGuide", "HelloFresh", "Auto1"]:
+                # Well-known larger startups
+                if round_type == 'Seed':
+                    amount = random.uniform(1.5, 4.0)  # Higher seed for known companies
+                elif round_type == 'Series A':
+                    amount = random.uniform(10.0, 25.0)  # Higher Series A
+                elif round_type == 'Series B':
+                    amount = random.uniform(30.0, 80.0)
+                elif round_type == 'Series C':
+                    amount = random.uniform(80.0, 150.0)
+                elif round_type == 'Series D+':
+                    amount = random.uniform(150.0, 300.0)
+                elif round_type == 'Growth':
+                    amount = random.uniform(100.0, 500.0)
+                else:  # IPO
+                    amount = random.uniform(300.0, 1000.0)
+            elif startup_name in ["Personio", "Wefox", "Trade Republic", "Tier Mobility", "Gorillas"]:
+                # Medium-sized well-known startups
+                if round_type == 'Seed':
+                    amount = random.uniform(1.0, 3.0)
+                elif round_type == 'Series A':
+                    amount = random.uniform(8.0, 20.0)
+                elif round_type == 'Series B':
+                    amount = random.uniform(20.0, 60.0)
+                elif round_type == 'Series C':
+                    amount = random.uniform(60.0, 120.0)
+                else:
+                    amount = random.uniform(100.0, 200.0)
+            else:
+                # Other startups
+                if round_type == 'Seed':
+                    amount = random.uniform(0.5, 3.0)  # €500K to €3M
+                elif round_type == 'Series A':
+                    amount = random.uniform(3.0, 15.0)  # €3M to €15M
+                elif round_type == 'Series B':
+                    amount = random.uniform(15.0, 50.0)  # €15M to €50M
+                elif round_type == 'Series C':
+                    amount = random.uniform(50.0, 100.0)  # €50M to €100M
+                elif round_type == 'Series D+':
+                    amount = random.uniform(100.0, 300.0)  # €100M to €300M
+                elif round_type == 'Growth':
+                    amount = random.uniform(50.0, 500.0)  # €50M to €500M
+                else:  # IPO
+                    amount = random.uniform(200.0, 1000.0)  # €200M to €1B
+            
+            # Adjust real investors count based on round size
+            if amount < 5:  # Small rounds have fewer investors
+                num_investors = random.randint(1, 2)
+            elif amount < 20:  # Medium rounds
+                num_investors = random.randint(2, 3)
+            elif amount < 100:  # Larger rounds
+                num_investors = random.randint(3, 5)
+            else:  # Very large rounds
+                num_investors = random.randint(4, 7)
+                
+            investors = random.sample(german_investors, num_investors)
+            
+            # Valuation (typically a multiple of the funding amount)
+            valuation_multiple = random.uniform(3, 10)
+            valuation = amount * valuation_multiple
+            
+            data.append({
+                'startup_name': startup_name,
+                'industry': industry,
+                'country': 'Germany',
+                'city': city,
+                'funding_round': round_type,
+                'funding_amount_millions': round(amount, 2),
+                'funding_date': funding_date,
+                'investors': ', '.join(investors),
+                'valuation_millions': round(valuation, 2),
+                'year': funding_date.year,
+                'month': funding_date.month,
+                'quarter': (funding_date.month - 1) // 3 + 1
+            })
     
     # Convert to DataFrame
     df = pd.DataFrame(data)
@@ -615,6 +1149,8 @@ def main():
     # Header
     st.markdown("<h1 class='main-header'>German Startup Funding Analyzer</h1>", unsafe_allow_html=True)
     st.markdown("Explore and visualize German startup funding trends across industries, cities, and time periods.")
+    st.markdown(" > Search with API is recommended option.")
+    st.markdown(" > However, there is a limitation with Groq API. For better search in the funding area, Crunchbase API and Dealroom API are recommended.")
 
     # Data Collection Section - Added at the beginning
     st.subheader("Data Collection")
@@ -791,16 +1327,16 @@ def main():
     st.markdown("<h2 class='sub-header'>Key Metrics</h2>", unsafe_allow_html=True)
     col1, col2, col3, col4 = st.columns(4)
     
-    # Export full dataset button
-    if st.button("Export Full Dataset as CSV"):
-        csv_full = data.to_csv(index=False)
-        st.download_button(
-            label="Download Complete Dataset",
-            data=csv_full,
-            file_name=f"complete_german_startup_data_{datetime.now().strftime('%Y%m%dT%H-%M')}.csv",
-            mime="text/csv",
-            key="full_data_download"
-        )
+    # # Export full dataset button
+    # if st.button("Export Full Dataset as CSV"):
+    #     csv_full = data.to_csv(index=False)
+    #     st.download_button(
+    #         label="Download Complete Dataset",
+    #         data=csv_full,
+    #         file_name=f"complete_german_startup_data_{datetime.now().strftime('%Y%m%dT%H-%M')}.csv",
+    #         mime="text/csv",
+    #         key="full_data_download"
+    #     )
     
     # Helper function to create consistent cards
     def create_metric_card(col, title, value, unit=""):
@@ -962,8 +1498,9 @@ def main():
         # Aggregate by month and year
         timeline_option = st.radio(
             "Select time granularity:",
-            ("Monthly", "Quarterly", "Yearly"),
-            horizontal=True
+            ["Monthly", "Quarterly", "Yearly"],
+            horizontal=True,
+            key="timeline_granularity_radio"
         )
         
         if timeline_option == "Monthly":
@@ -1174,3 +1711,24 @@ def main():
 
 if __name__ == "__main__":
     main()
+amount_patterns = [
+    r'(\d+(?:\.\d+)?)\s*[Bb]illion\s*€',
+    r'(\d+(?:\.\d+)?)\s*[Bb]'
+]
+
+def extract_funding_amount(title):
+    """
+    Extract funding amount in millions of euros from a given title.
+    """
+    for pattern in amount_patterns:
+        match = re.search(pattern, title)
+        if match:
+            amount = float(match.group(1))
+            
+            # Convert billions to millions
+            if '[Bb]illion' in pattern or '[Bb]' in pattern:
+                amount *= 1000
+                
+            # If using default of millions, no conversion needed
+            return round(amount, 2)
+    
